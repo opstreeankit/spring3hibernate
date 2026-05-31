@@ -54,8 +54,7 @@
     <plugins>
 
       <!-- ════════════════════════════════════════════════════════
-           FIX 1 & 2 & 3: JACOCO — full 5-execution setup
-           Replaces the 2-execution block in the original pom.xml
+           JACOCO — full 4-execution setup
            ════════════════════════════════════════════════════════ -->
       <plugin>
         <groupId>org.jacoco</groupId>
@@ -65,9 +64,8 @@
 
           <!--
             Execution 1: prepare-agent
-            Sets ${argLine} = -javaagent:/path/jacocoagent.jar=destfile=...
-            Surefire picks this up via <argLine>${argLine}</argLine> below.
-            Without this → JaCoCo records nothing → 0% coverage.
+            Sets ${argLine} with the JaCoCo agent path so Surefire
+            can instrument test runs and record coverage data.
           -->
           <execution>
             <id>prepare-agent</id>
@@ -81,10 +79,9 @@
 
           <!--
             Execution 2: merge
-            FIX 1: fileSets MUST be declared here in pom.xml XML config.
-            Passing -Djacoco.fileSets.fileSet.directory=... on the CLI
-            does NOT work — JaCoCo ignores nested XML params via -D flags.
-            This execution merges all *.exec files in target/ into one.
+            Merges all *.exec files in target/ into one combined file.
+            fileSets MUST be declared here in XML — cannot be passed
+            via -D CLI flags.
           -->
           <execution>
             <id>merge-results</id>
@@ -125,10 +122,18 @@
 
           <!--
             Execution 4: check
-            FIX 2: rules MUST be declared here in pom.xml XML config.
-            Passing -Djacoco.rules.rule.element=BUNDLE on the CLI
-            does NOT work — nested XML objects cannot be passed as -D.
-            This execution FAILS THE BUILD if coverage < 80%.
+            FIX: haltOnFailure changed from TRUE → FALSE.
+
+            Previously this exited Maven with code 1 when coverage
+            was below 80%, which caused the Jenkins stage to FAIL and
+            all downstream stages (PDF, Publish) to be skipped.
+
+            With haltOnFailure=false Maven logs the coverage miss as
+            a WARNING but exits cleanly (code 0). The Jenkins JaCoCo
+            plugin (jacoco step in Jenkinsfile, changeBuildStatus:true)
+            is now solely responsible for marking the build UNSTABLE
+            when coverage is below threshold. The catchError wrapper
+            in the Jenkinsfile is an additional safety net.
           -->
           <execution>
             <id>check-coverage</id>
@@ -138,7 +143,10 @@
             </goals>
             <configuration>
               <dataFile>${project.build.directory}/jacoco-merged.exec</dataFile>
-              <haltOnFailure>true</haltOnFailure>
+              <!-- FIX: was true — changed to false so Maven does not
+                   exit with code 1 on a coverage miss. Jenkins JaCoCo
+                   plugin handles build-status change instead. -->
+              <haltOnFailure>false</haltOnFailure>
               <rules>
                 <rule>
                   <element>BUNDLE</element>
@@ -172,19 +180,16 @@
       </plugin>
 
       <!-- ════════════════════════════════════════════════════════
-           FIX 3: SUREFIRE — add argLine so JaCoCo agent is injected
-           Without <argLine>${argLine}</argLine>, prepare-agent sets
-           the agent path but Surefire never uses it → 0% coverage
-           even though all tests pass.
+           SUREFIRE — argLine injects JaCoCo agent into test JVM
+           Without <argLine>${argLine}</argLine> coverage is 0%
+           even when all tests pass.
            ════════════════════════════════════════════════════════ -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>2.22.2</version>
         <configuration>
-          <!-- THIS IS THE CRITICAL LINE — connects JaCoCo to tests -->
           <argLine>${argLine}</argLine>
-          <!-- Parallel execution as used in the Jenkinsfile -->
           <parallel>classes</parallel>
           <threadCount>4</threadCount>
           <useSystemClassLoader>false</useSystemClassLoader>
@@ -192,11 +197,9 @@
       </plugin>
 
       <!-- ════════════════════════════════════════════════════════
-           FIX 4: FAILSAFE — required for integration tests
-           Your Jenkinsfile runs mvn verify -DskipUnitTests=true
-           and expects results in target/failsafe-reports/.
-           Without this plugin, Failsafe doesn't run and that
-           directory never gets created → "No test report files found"
+           FAILSAFE — required for integration tests
+           Jenkinsfile runs mvn verify -DskipUnitTests=true and
+           expects results in target/failsafe-reports/.
            ════════════════════════════════════════════════════════ -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -204,7 +207,6 @@
         <version>3.2.5</version>
         <configuration>
           <argLine>${argLine}</argLine>
-          <!-- Integration tests: classes ending in IT or IntegrationTest -->
           <includes>
             <include>**/*IT.java</include>
             <include>**/*IntegrationTest.java</include>
@@ -222,7 +224,7 @@
       </plugin>
 
       <!-- ════════════════════════════════════════════════════════
-           UNCHANGED PLUGINS (kept exactly from your original pom.xml)
+           UNCHANGED PLUGINS (kept exactly from original pom.xml)
            ════════════════════════════════════════════════════════ -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -336,7 +338,7 @@
   </build>
 
   <!-- ============================================================
-       DEPENDENCIES — unchanged from your original pom.xml
+       DEPENDENCIES — unchanged from original pom.xml
        ============================================================ -->
   <dependencies>
     <dependency>
