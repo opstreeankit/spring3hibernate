@@ -13,6 +13,21 @@ options {
 
 stages {
 
+    stage('Debug Maven') {
+            steps {
+                sh '''
+                    echo "===== JAVA VERSION ====="
+                    java -version
+
+                    echo "===== MAVEN VERSION ====="
+                    mvn -version
+
+                    echo "===== DOCKER VERSION ====="
+                    docker --version
+                '''
+            }
+        }
+        
     stage('Build Application') {
         steps {
             sh '''
