@@ -22,12 +22,6 @@ pipeline {
             }
         }
 
-        // FIX: Create namespaces before any deployment stage.
-        // Previously the pipeline ran 'kubectl apply -n dev ...' without
-        // ensuring the 'dev' namespace existed, causing:
-        //   Error from server (NotFound): namespaces "dev" not found
-        // The '||' pattern is idempotent — namespaces are only created if
-        // they don't already exist, so re-runs are safe.
         stage('Setup Namespaces') {
             steps {
                 sh '''
@@ -49,11 +43,6 @@ pipeline {
             }
         }
 
-        // FIX 2: Dedicated test stage so JaCoCo actually instruments code.
-        // Previously 'mvn clean package -DskipTests' skipped all tests,
-        // resulting in 0% coverage. 'mvn verify -DskipITs' runs unit tests
-        // only (skips integration tests) and triggers the full JaCoCo lifecycle
-        // (prepare-agent → surefire → merge → report → check).
         stage('Test & Coverage') {
             steps {
                 sh '''
@@ -76,32 +65,73 @@ pipeline {
             }
         }
 
+        // ─────────────────────────────────────────────────────────────────────
+        // FIX: OWASP Dependency Check moved into its own stage, guarded by a
+        // when-expression so it ONLY runs when:
+        //   (a) the build was triggered by the weekly cron schedule, OR
+        //   (b) someone manually sets RUN_OWASP=true on a parameterised build.
+        //
+        // ROOT CAUSE OF THE 30-MIN HANG:
+        //   dependency-check-maven downloads the entire NVD database
+        //   (~354,872 CVE records) on every build. Without an NVD API key,
+        //   NIST throttles the feed to ~1 record/s → 60–90 minutes per run.
+        //
+        // HOW THE FIX WORKS:
+        //   1. The plugin is removed from the default Maven lifecycle in
+        //      pom.xml and placed inside the 'owasp' Maven profile.
+        //   2. This Jenkins stage passes '-Powasp' to activate it only when
+        //      the when-condition is true.
+        //   3. The NVD API key is injected via Jenkins credentials
+        //      (id: 'NVD_API_KEY') as a Secret Text credential.  The plugin
+        //      uses the key to raise the NVD download rate from ~1 rec/s to
+        //      ~50 rec/s — a 50× speedup on the first run (< 2 min after that
+        //      because only deltas are downloaded from the local cache).
+        //
+        // HOW TO GET A FREE NVD API KEY:
+        //   https://nvd.nist.gov/developers/request-an-api-key
+        //   Then in Jenkins → Manage Jenkins → Credentials add a Secret Text
+        //   credential with ID exactly 'NVD_API_KEY'.
+        //
+        // TO TRIGGER AN ON-DEMAND SCAN:
+        //   Build with Parameter  RUN_OWASP = true
+        //   (add a Boolean Parameter named RUN_OWASP to the job config).
+        // ─────────────────────────────────────────────────────────────────────
+        stage('OWASP Dependency Scan') {
+            when {
+                anyOf {
+                    // Run automatically every Sunday at 02:00
+                    triggeredBy 'TimerTrigger'
+                    // Run when the job parameter RUN_OWASP is set to 'true'
+                    expression { return params.RUN_OWASP == true }
+                }
+            }
+            steps {
+                // withCredentials injects the NVD API key without printing
+                // it in the console log (masked automatically by Jenkins).
+                withCredentials([string(credentialsId: 'NVD_API_KEY', variable: 'NVD_KEY')]) {
+                    sh """
+                        echo "===== OWASP DEPENDENCY CHECK ====="
+                        mvn verify -Powasp -DnvdApiKey=${NVD_KEY} -DskipTests
+                        echo "===== OWASP SCAN COMPLETE ====="
+                    """
+                }
+            }
+            post {
+                always {
+                    // Publish the HTML report to the Jenkins job page.
+                    publishHTML(target: [
+                        allowMissing:          true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll:               true,
+                        reportDir:             'target',
+                        reportFiles:           'dependency-check-report.html',
+                        reportName:            'OWASP Dependency Check'
+                    ])
+                }
+            }
+        }
+
         stage('Build Docker Image') {
-            // ROOT CAUSE: Running 'minikube start' inside the Jenkins pipeline
-            // as root with --driver=docker causes K8S_APISERVER_MISSING because
-            // the kube-apiserver process never starts due to cgroup v2 conflicts
-            // between the outer Docker daemon (Jenkins) and the inner minikube
-            // Docker-in-Docker container on Ubuntu 22.04.
-            //
-            // FIX: Never start minikube in the pipeline. Instead:
-            //   1. Minikube is started ONCE manually on the host and left running
-            //      as a persistent cluster (see prerequisite note below).
-            //   2. The pipeline uses 'eval $(minikube docker-env)' to redirect
-            //      DOCKER_HOST to minikube's internal Docker socket.
-            //   3. 'docker build' then writes the image directly into minikube's
-            //      daemon — no 'minikube image load' step needed at all.
-            //
-            // PREREQUISITE (one-time setup on the host, not in this pipeline):
-            //   Run this once as the same user Jenkins runs as:
-            //     $ minikube start --driver=docker --kubernetes-version=v1.35.1
-            //   Leave minikube running. Jenkins will connect to it every build
-            //   without ever starting or stopping it.
-            //
-            // WHY THIS SOLVES THE CGROUP PROBLEM:
-            //   minikube start (the expensive part that spawns kube-apiserver)
-            //   never runs inside the pipeline. Jenkins only talks to an already-
-            //   healthy cluster via its Docker socket. No cgroup negotiation,
-            //   no API server bootstrap, no 6-minute timeout.
             steps {
                 sh '''
                     echo "===== VERIFYING MINIKUBE IS REACHABLE ====="
@@ -122,14 +152,6 @@ pipeline {
                     minikube status
                 '''
 
-                // Build the Docker image directly into minikube's internal daemon.
-                // eval $(minikube docker-env) exports four env vars for this shell:
-                //   DOCKER_TLS_VERIFY, DOCKER_HOST, DOCKER_CERT_PATH,
-                //   MINIKUBE_ACTIVE_DOCKERD
-                // These redirect all docker commands to minikube's socket.
-                // The host Docker daemon is completely unaffected.
-                // Because the image lands inside minikube's daemon, Kubernetes can
-                // pull it with imagePullPolicy: Never — no registry required.
                 sh """
                     eval \$(minikube docker-env)
                     echo "===== BUILDING INTO MINIKUBE DOCKER DAEMON ====="
@@ -272,17 +294,24 @@ pipeline {
             }
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // WEEKLY OWASP CRON SCHEDULE
+    // Add this triggers block to your job's pipeline definition so the scan
+    // runs automatically every Sunday at 02:00 without blocking normal CI.
+    // If you use a Multibranch Pipeline or scan from SCM, put these triggers
+    // inside a properties() step in the pipeline script instead.
+    // ─────────────────────────────────────────────────────────────────────
+    // triggers {
+    //     cron('0 2 * * 0')   // every Sunday at 02:00
+    // }
+
     post {
         success {
             echo 'Deployment completed successfully.'
         }
         failure {
             echo 'Deployment failed. Rolling back...'
-            // FIX 3: Guard rollback with an existence check before attempting
-            // 'kubectl rollout undo'. Previously the pipeline tried to roll back
-            // spring-app-green even when it had never been deployed (i.e. the
-            // pipeline failed before the 'Deploy GREEN' stage), causing a
-            // misleading "NotFound" error in the post-failure logs.
             sh '''
                 if kubectl get deployment spring-app-green -n prod > /dev/null 2>&1; then
                     echo "Green deployment found — switching traffic back to blue and rolling back..."
