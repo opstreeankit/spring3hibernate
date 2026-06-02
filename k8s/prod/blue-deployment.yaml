@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: spring-app-blue
+
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: spring-app
+      color: blue
+
+  template:
+    metadata:
+      labels:
+        app: spring-app
+        color: blue
+
+    spec:
+      containers:
+      - name: spring-app
+
+        image: spring3hibernate:v2
+
+        imagePullPolicy: Never
+
+        ports:
+        - containerPort: 8080
+
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 15
+
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 30

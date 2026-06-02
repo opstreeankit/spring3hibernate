@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: spring-app-green
+
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: spring-app
+      color: green
+
+  template:
+    metadata:
+      labels:
+        app: spring-app
+        color: green
+
+    spec:
+      containers:
+      - name: spring-app
+
+        image: IMAGE_PLACEHOLDER
+
+        imagePullPolicy: Never
+
+        ports:
+        - containerPort: 8080
+
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 15
+
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 30
