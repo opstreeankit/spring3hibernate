@@ -1,4 +1,7 @@
-FROM maven:3.3-jdk-8 as builder
+#FROM maven:3.3-jdk-8 as builder
+FROM maven:3.9.9-eclipse-temurin-11 AS builder
+
+RUN mvn -version
 COPY . /usr/src/mymaven/
 WORKDIR /usr/src/mymaven/
 RUN mvn clean install
