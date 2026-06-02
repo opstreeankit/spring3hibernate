@@ -1,645 +1,249 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
-             http://maven.apache.org/maven-v4_0_0.xsd">
+pipeline {
+agent any
 
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>Spring3HibernateApp</groupId>
-  <artifactId>Spring3HibernateApp</artifactId>
-  <packaging>war</packaging>
-  <version>1.8-SNAPSHOT</version>
-  <name>Spring3HibernateApp</name>
-  <url>http://maven.apache.org</url>
+environment {
+    APP_NAME = "spring3hibernate"
+    IMAGE_TAG = "${BUILD_NUMBER}"
+}
 
-  <scm>
-    <developerConnection>
-      scm:git:git@github.com:OpsTree/ContinuousIntegration.git
-    </developerConnection>
-    <tag>HEAD</tag>
-  </scm>
+options {
+    timestamps()
+    disableConcurrentBuilds()
+}
 
-  <distributionManagement>
-    <repository>
-      <id>central</id>
-      <name>central</name>
-      <url>http://192.168.0.37:8081/artifactory/ext-release-local</url>
-    </repository>
-    <snapshotRepository>
-      <id>snapshots</id>
-      <name>libs-snapshot-local</name>
-      <url>http://192.168.0.37:8081/artifactory/ext-snapshot-local</url>
-    </snapshotRepository>
-  </distributionManagement>
+stages {
 
-  <!-- ============================================================
-       REPORTING — FindBugs site report (unchanged from original)
-       ============================================================ -->
-  <reporting>
-    <plugins>
-      <plugin>
-        <groupId>org.codehaus.mojo</groupId>
-        <artifactId>findbugs-maven-plugin</artifactId>
-        <version>3.0.5</version>
-        <configuration>
-          <effort>Max</effort>
-          <threshold>Low</threshold>
-          <xmlOutput>true</xmlOutput>
-        </configuration>
-      </plugin>
-    </plugins>
-  </reporting>
+    stage('Build Application') {
+        steps {
+            sh '''
+                mvn clean package -DskipTests
+            '''
+        }
+    }
 
-  <build>
-    <plugins>
+    // FIX 2: Dedicated test stage so JaCoCo actually instruments code.
+    // Previously 'mvn clean package -DskipTests' skipped all tests,
+    // resulting in 0% coverage. 'mvn verify -DskipITs' runs unit tests
+    // only (skips integration tests) and triggers the full JaCoCo lifecycle
+    // (prepare-agent → surefire → merge → report → check).
+    stage('Test & Coverage') {
+        steps {
+            sh '''
+                mvn verify -DskipITs
+            '''
+        }
+        post {
+            always {
+                junit '**/target/surefire-reports/*.xml'
+                jacoco(
+                    execPattern:         '**/target/jacoco-merged.exec',
+                    classPattern:        '**/target/classes',
+                    sourcePattern:       '**/src/main/java',
+                    changeBuildStatus:   true,
+                    minimumLineCoverage:    '80',
+                    minimumBranchCoverage:  '75',
+                    minimumClassCoverage:   '80'
+                )
+            }
+        }
+    }
 
-      <!-- ════════════════════════════════════════════════════════
-           JACOCO — full 4-execution setup
-           ════════════════════════════════════════════════════════ -->
-      <plugin>
-        <groupId>org.jacoco</groupId>
-        <artifactId>jacoco-maven-plugin</artifactId>
-        <version>0.8.11</version>
-        <executions>
+    stage('Build Docker Image') {
+        steps {
+            sh """
+                docker build -t ${APP_NAME}:${IMAGE_TAG} .
+            """
 
-          <!--
-            Execution 1: prepare-agent
-            Sets ${argLine} with the JaCoCo agent path so Surefire
-            can instrument test runs and record coverage data.
-          -->
-          <execution>
-            <id>prepare-agent</id>
-            <goals>
-              <goal>prepare-agent</goal>
-            </goals>
-            <configuration>
-              <destFile>${project.build.directory}/jacoco.exec</destFile>
-            </configuration>
-          </execution>
+            sh """
+                minikube image load ${APP_NAME}:${IMAGE_TAG}
+            """
+        }
+    }
 
-          <!--
-            Execution 2: merge
-            Merges all *.exec files in target/ into one combined file.
-            fileSets MUST be declared here in XML — cannot be passed
-            via -D CLI flags.
-          -->
-          <execution>
-            <id>merge-results</id>
-            <phase>verify</phase>
-            <goals>
-              <goal>merge</goal>
-            </goals>
-            <configuration>
-              <fileSets>
-                <fileSet>
-                  <directory>${project.build.directory}</directory>
-                  <includes>
-                    <include>*.exec</include>
-                  </includes>
-                </fileSet>
-              </fileSets>
-              <destFile>${project.build.directory}/jacoco-merged.exec</destFile>
-            </configuration>
-          </execution>
+    stage('Deploy DEV') {
+        steps {
 
-          <!--
-            Execution 3: report
-            Generates HTML + XML + CSV from the merged exec file.
-            Output: target/site/jacoco/index.html  (Jenkins publishHTML)
-                    target/site/jacoco/jacoco.csv   (PDF generator reads this)
-          -->
-          <execution>
-            <id>generate-report</id>
-            <phase>verify</phase>
-            <goals>
-              <goal>report</goal>
-            </goals>
-            <configuration>
-              <dataFile>${project.build.directory}/jacoco-merged.exec</dataFile>
-              <outputDirectory>${project.build.directory}/site/jacoco</outputDirectory>
-            </configuration>
-          </execution>
+            milestone(1)
 
-          <!--
-            Execution 4: check
-            FIX: haltOnFailure changed from TRUE → FALSE.
+            sh """
+                sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/dev/deployment.yaml
 
-            Previously this exited Maven with code 1 when coverage
-            was below 80%, which caused the Jenkins stage to FAIL and
-            all downstream stages (PDF, Publish) to be skipped.
+                kubectl apply -n dev -f k8s/dev/deployment.yaml
+                kubectl apply -n dev -f k8s/dev/service.yaml
 
-            With haltOnFailure=false Maven logs the coverage miss as
-            a WARNING but exits cleanly (code 0). The Jenkins JaCoCo
-            plugin (jacoco step in Jenkinsfile, changeBuildStatus:true)
-            is now solely responsible for marking the build UNSTABLE
-            when coverage is below threshold. The catchError wrapper
-            in the Jenkinsfile is an additional safety net.
-          -->
-          <execution>
-            <id>check-coverage</id>
-            <phase>verify</phase>
-            <goals>
-              <goal>check</goal>
-            </goals>
-            <configuration>
-              <dataFile>${project.build.directory}/jacoco-merged.exec</dataFile>
-              <!-- FIX: was true — changed to false so Maven does not
-                   exit with code 1 on a coverage miss. Jenkins JaCoCo
-                   plugin handles build-status change instead. -->
-              <haltOnFailure>false</haltOnFailure>
-              <rules>
-                <rule>
-                  <element>BUNDLE</element>
-                  <limits>
-                    <limit>
-                      <counter>LINE</counter>
-                      <value>COVEREDRATIO</value>
-                      <minimum>0.80</minimum>
-                    </limit>
-                    <limit>
-                      <counter>BRANCH</counter>
-                      <value>COVEREDRATIO</value>
-                      <minimum>0.75</minimum>
-                    </limit>
-                    <limit>
-                      <counter>CLASS</counter>
-                      <value>COVEREDRATIO</value>
-                      <minimum>0.80</minimum>
-                    </limit>
-                  </limits>
-                </rule>
-              </rules>
-              <excludes>
-                <exclude>**/model/**</exclude>
-                <exclude>**/bean/**</exclude>
-              </excludes>
-            </configuration>
-          </execution>
+                kubectl rollout status deployment/spring-app \
+                -n dev --timeout=180s
+            """
+        }
+    }
 
-        </executions>
-      </plugin>
+    stage('DEV Health Check') {
+        steps {
+            script {
+                retry(5) {
+                    sleep 15
 
-      <!-- ════════════════════════════════════════════════════════
-           SUREFIRE — argLine injects JaCoCo agent into test JVM
-           Without <argLine>${argLine}</argLine> coverage is 0%
-           even when all tests pass.
-           ════════════════════════════════════════════════════════ -->
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-surefire-plugin</artifactId>
-        <version>2.22.2</version>
-        <configuration>
-          <argLine>${argLine}</argLine>
-          <parallel>classes</parallel>
-          <threadCount>4</threadCount>
-          <useSystemClassLoader>false</useSystemClassLoader>
-        </configuration>
-      </plugin>
+                    httpRequest(
+                        url: 'http://localhost:30080/',
+                        validResponseCodes: '200'
+                    )
+                }
+            }
+        }
+    }
 
-      <!-- ════════════════════════════════════════════════════════
-           FAILSAFE — required for integration tests
-           Jenkinsfile runs mvn verify -DskipUnitTests=true and
-           expects results in target/failsafe-reports/.
-           ════════════════════════════════════════════════════════ -->
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-failsafe-plugin</artifactId>
-        <version>3.2.5</version>
-        <configuration>
-          <argLine>${argLine}</argLine>
-          <includes>
-            <include>**/*IT.java</include>
-            <include>**/*IntegrationTest.java</include>
-          </includes>
-          <reportsDirectory>${project.build.directory}/failsafe-reports</reportsDirectory>
-        </configuration>
-        <executions>
-          <execution>
-            <goals>
-              <goal>integration-test</goal>
-              <goal>verify</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
+    stage('Approve STAGING') {
+        steps {
+            input(
+                message: 'Deploy to STAGING?',
+                ok: 'Deploy'
+            )
+        }
+    }
 
-      <!-- ════════════════════════════════════════════════════════
-           UNCHANGED PLUGINS (kept exactly from original pom.xml)
-           ════════════════════════════════════════════════════════ -->
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-release-plugin</artifactId>
-        <version>2.5.1</version>
-      </plugin>
+    stage('Deploy STAGING') {
+        steps {
 
-      <plugin>
-        <groupId>org.owasp</groupId>
-        <artifactId>dependency-check-maven</artifactId>
-        <version>9.0.10</version>
-        <configuration>
-          <format>HTML</format>
-          <ossindexAnalyzerEnabled>false</ossindexAnalyzerEnabled>
-          <failBuildOnCVSS>11</failBuildOnCVSS>
-        </configuration>
-        <executions>
-          <execution>
-            <goals>
-              <goal>check</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
+            milestone(2)
 
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-checkstyle-plugin</artifactId>
-        <version>2.14</version>
-      </plugin>
+            sh """
+                sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/staging/deployment.yaml
 
-      <plugin>
-        <groupId>org.codehaus.mojo</groupId>
-        <artifactId>findbugs-maven-plugin</artifactId>
-        <version>3.0.5</version>
-        <configuration>
-          <effort>Max</effort>
-          <failOnError>false</failOnError>
-          <threshold>Low</threshold>
-          <xmlOutput>true</xmlOutput>
-          <findbugsXmlOutputDirectory>${project.build.directory}/findbugs</findbugsXmlOutputDirectory>
-        </configuration>
-        <executions>
-          <execution>
-            <id>analyze-compile</id>
-            <phase>compile</phase>
-            <goals>
-              <goal>check</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
+                kubectl apply -n staging -f k8s/staging/deployment.yaml
+                kubectl apply -n staging -f k8s/staging/service.yaml
 
-      <plugin>
-        <groupId>org.codehaus.mojo</groupId>
-        <artifactId>cobertura-maven-plugin</artifactId>
-        <version>2.5.1</version>
-        <configuration>
-          <formats>
-            <format>xml</format>
-          </formats>
-        </configuration>
-        <executions>
-          <execution>
-            <phase>package</phase>
-            <goals>
-              <goal>cobertura</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
+                kubectl rollout status deployment/spring-app \
+                -n staging --timeout=180s
+            """
+        }
+    }
 
-      <plugin>
-        <artifactId>maven-compiler-plugin</artifactId>
-        <version>2.3.2</version>
-        <configuration>
-          <source>8</source>
-          <target>8</target>
-        </configuration>
-      </plugin>
+    stage('STAGING Health Check') {
+        steps {
+            script {
+                retry(5) {
+                    sleep 15
 
-      <plugin>
-        <artifactId>maven-war-plugin</artifactId>
-        <version>3.4.0</version>
-        <configuration>
-          <warName>Spring3HibernateApp</warName>
-        </configuration>
-      </plugin>
+                    httpRequest(
+                        url: 'http://localhost:30081/',
+                        validResponseCodes: '200'
+                    )
+                }
+            }
+        }
+    }
 
-      <plugin>
-        <groupId>org.apache.tomcat.maven</groupId>
-        <artifactId>tomcat6-maven-plugin</artifactId>
-        <version>2.2</version>
-        <executions>
-          <execution>
-            <id>deploy-service</id>
-            <goals>
-              <goal>deploy</goal>
-            </goals>
-          </execution>
-        </executions>
-        <configuration>
-          <warFile>target/Spring3HibernateApp.war</warFile>
-          <path>/</path>
-          <update>true</update>
-          <port>11011</port>
-        </configuration>
-      </plugin>
+    stage('Approve PRODUCTION') {
+        steps {
+            input(
+                message: 'Deploy to Production?',
+                ok: 'Deploy'
+            )
+        }
+    }
 
-    </plugins>
-  </build>
+    stage('Deploy GREEN') {
+        steps {
 
-  <!-- ============================================================
-       DEPENDENCIES — unchanged from original pom.xml
-       ============================================================ -->
-  <dependencies>
-    <dependency>
-      <groupId>org.mockito</groupId>
-      <artifactId>mockito-all</artifactId>
-      <version>1.9.5</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.activation</groupId>
-      <artifactId>activation</artifactId>
-      <version>1.1</version>
-    </dependency>
-    <dependency>
-      <groupId>antlr</groupId>
-      <artifactId>antlr</artifactId>
-      <version>2.7.6</version>
-    </dependency>
-    <dependency>
-      <groupId>aopalliance</groupId>
-      <artifactId>aopalliance</artifactId>
-      <version>1.0</version>
-    </dependency>
-    <dependency>
-      <groupId>asm</groupId>
-      <artifactId>asm</artifactId>
-      <version>1.5.3</version>
-    </dependency>
-    <dependency>
-      <groupId>asm</groupId>
-      <artifactId>asm-attrs</artifactId>
-      <version>1.5.3</version>
-    </dependency>
-    <dependency>
-      <groupId>cglib</groupId>
-      <artifactId>cglib</artifactId>
-      <version>2.1_3</version>
-    </dependency>
-    <dependency>
-      <groupId>commons-beanutils</groupId>
-      <artifactId>commons-beanutils</artifactId>
-      <version>1.7.0</version>
-    </dependency>
-    <dependency>
-      <groupId>commons-io</groupId>
-      <artifactId>commons-io</artifactId>
-      <version>1.1</version>
-    </dependency>
-    <dependency>
-      <groupId>commons-logging</groupId>
-      <artifactId>commons-logging</artifactId>
-      <version>1.1.1</version>
-    </dependency>
-    <dependency>
-      <groupId>commons-lang</groupId>
-      <artifactId>commons-lang</artifactId>
-      <version>2.5</version>
-    </dependency>
-    <dependency>
-      <groupId>commons-collections</groupId>
-      <artifactId>commons-collections</artifactId>
-      <version>2.1.1</version>
-    </dependency>
-    <dependency>
-      <groupId>commons-fileupload</groupId>
-      <artifactId>commons-fileupload</artifactId>
-      <version>1.1.1</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.commons</groupId>
-      <artifactId>commons-email</artifactId>
-      <version>1.1</version>
-    </dependency>
-    <dependency>
-      <groupId>commons-digester</groupId>
-      <artifactId>commons-digester</artifactId>
-      <version>1.8</version>
-    </dependency>
-    <dependency>
-      <groupId>dom4j</groupId>
-      <artifactId>dom4j</artifactId>
-      <version>1.6.1</version>
-    </dependency>
-    <dependency>
-      <groupId>dumbster</groupId>
-      <artifactId>dumbster</artifactId>
-      <version>1.6</version>
-    </dependency>
-    <dependency>
-      <groupId>ehcache</groupId>
-      <artifactId>ehcache</artifactId>
-      <version>1.2.3</version>
-    </dependency>
-    <dependency>
-      <groupId>icu4j</groupId>
-      <artifactId>icu4j</artifactId>
-      <version>2.6.1</version>
-    </dependency>
-    <dependency>
-      <groupId>javassist</groupId>
-      <artifactId>javassist</artifactId>
-      <version>3.4.GA</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.xml.bind</groupId>
-      <artifactId>jaxb-api</artifactId>
-      <version>2.1</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.xml</groupId>
-      <artifactId>jaxb-impl</artifactId>
-      <version>2.1</version>
-    </dependency>
-    <dependency>
-      <groupId>jaxen</groupId>
-      <artifactId>jaxen</artifactId>
-      <version>1.1.1</version>
-    </dependency>
-    <dependency>
-      <groupId>jdom</groupId>
-      <artifactId>jdom</artifactId>
-      <version>1.0</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.transaction</groupId>
-      <artifactId>jta</artifactId>
-      <version>1.1</version>
-    </dependency>
-    <dependency>
-      <groupId>jstl</groupId>
-      <artifactId>jstl</artifactId>
-      <version>1.2</version>
-    </dependency>
-    <dependency>
-      <groupId>log4j</groupId>
-      <artifactId>log4j</artifactId>
-      <version>1.2.14</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.lucene</groupId>
-      <artifactId>lucene-core</artifactId>
-      <version>2.3.2</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.lucene</groupId>
-      <artifactId>lucene-highlighter</artifactId>
-      <version>2.0.0</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.mail</groupId>
-      <artifactId>mail</artifactId>
-      <version>1.4</version>
-    </dependency>
-    <dependency>
-      <groupId>org.slf4j</groupId>
-      <artifactId>slf4j-api</artifactId>
-      <version>1.5.6</version>
-    </dependency>
-    <dependency>
-      <groupId>mysql</groupId>
-      <artifactId>mysql-connector-java</artifactId>
-      <version>5.0.5</version>
-    </dependency>
-    <dependency>
-      <groupId>org.slf4j</groupId>
-      <artifactId>slf4j-log4j12</artifactId>
-      <version>1.5.6</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.persistence</groupId>
-      <artifactId>persistence-api</artifactId>
-      <version>1.0</version>
-    </dependency>
-    <dependency>
-      <groupId>quartz</groupId>
-      <artifactId>quartz</artifactId>
-      <version>1.5.2</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.xml.stream</groupId>
-      <artifactId>stax-api</artifactId>
-      <version>1.0-2</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.validation</groupId>
-      <artifactId>validation-api</artifactId>
-      <version>1.0.0.GA</version>
-    </dependency>
-    <dependency>
-      <groupId>xalan</groupId>
-      <artifactId>xalan</artifactId>
-      <version>2.6.0</version>
-    </dependency>
-    <dependency>
-      <groupId>xerces</groupId>
-      <artifactId>xercesImpl</artifactId>
-      <version>2.6.2</version>
-    </dependency>
-    <dependency>
-      <groupId>xml-apis</groupId>
-      <artifactId>xml-apis</artifactId>
-      <version>1.3.02</version>
-    </dependency>
-    <dependency>
-      <groupId>xerces</groupId>
-      <artifactId>xmlParserAPIs</artifactId>
-      <version>2.6.2</version>
-    </dependency>
-    <dependency>
-      <groupId>xom</groupId>
-      <artifactId>xom</artifactId>
-      <version>1.0</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.servlet</groupId>
-      <artifactId>javax.servlet-api</artifactId>
-      <version>3.1.0</version>
-      <scope>provided</scope>
-    </dependency>
-    <!-- Hibernate -->
-    <dependency>
-      <groupId>org.hibernate</groupId>
-      <artifactId>hibernate-annotations</artifactId>
-      <version>3.3.1.GA</version>
-    </dependency>
-    <dependency>
-      <groupId>org.hibernate</groupId>
-      <artifactId>hibernate-entitymanager</artifactId>
-      <version>3.3.2.GA</version>
-    </dependency>
-    <dependency>
-      <groupId>org.hibernate</groupId>
-      <artifactId>hibernate-validator</artifactId>
-      <version>4.0.2.GA</version>
-    </dependency>
-    <dependency>
-      <groupId>org.hibernate</groupId>
-      <artifactId>hibernate</artifactId>
-      <version>3.2.6.ga</version>
-    </dependency>
-    <dependency>
-      <groupId>org.hibernate.common</groupId>
-      <artifactId>hibernate-commons-annotations</artifactId>
-      <version>4.0.0.Final</version>
-    </dependency>
-    <dependency>
-      <groupId>org.hibernate</groupId>
-      <artifactId>hibernate-search</artifactId>
-      <version>3.0.0.GA</version>
-    </dependency>
-    <!-- Spring -->
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-webmvc</artifactId>
-      <version>3.0.1.RELEASE</version>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-context</artifactId>
-      <version>3.0.1.RELEASE</version>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-core</artifactId>
-      <version>3.0.1.RELEASE</version>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-beans</artifactId>
-      <version>3.0.1.RELEASE</version>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-aop</artifactId>
-      <version>3.0.1.RELEASE</version>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-tx</artifactId>
-      <version>3.0.1.RELEASE</version>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-orm</artifactId>
-      <version>3.0.1.RELEASE</version>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-expression</artifactId>
-      <version>3.0.1.RELEASE</version>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-asm</artifactId>
-      <version>3.0.1.RELEASE</version>
-    </dependency>
-    <dependency>
-      <groupId>junit</groupId>
-      <artifactId>junit</artifactId>
-      <version>4.13.2</version>
-      <scope>test</scope>
-    </dependency>
-  </dependencies>
+            milestone(3)
 
-</project>
+            sh """
+                sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/prod/green-deployment.yaml
+
+                kubectl apply -n prod -f k8s/prod/green-deployment.yaml
+
+                kubectl rollout status deployment/spring-app-green \
+                -n prod --timeout=180s
+            """
+        }
+    }
+
+    stage('GREEN Health Check') {
+        steps {
+            script {
+                retry(10) {
+                    sleep 10
+
+                    httpRequest(
+                        url: 'http://localhost:30082/',
+                        validResponseCodes: '200'
+                    )
+                }
+            }
+        }
+    }
+
+    stage('Switch Traffic To GREEN') {
+        steps {
+
+            sh '''
+                kubectl patch service spring-app-service \
+                -n prod \
+                -p '{"spec":{"selector":{"app":"spring-app","color":"green"}}}'
+            '''
+        }
+    }
+
+    stage('Production Verification') {
+        steps {
+            script {
+                retry(5) {
+                    sleep 10
+
+                    httpRequest(
+                        url: 'http://localhost:30082/',
+                        validResponseCodes: '200'
+                    )
+                }
+            }
+        }
+    }
+
+    stage('Scale Down BLUE') {
+        steps {
+
+            sh '''
+                kubectl scale deployment spring-app-blue \
+                --replicas=0 \
+                -n prod
+            '''
+        }
+    }
+}
+
+post {
+
+    success {
+        echo 'Deployment completed successfully.'
+    }
+
+    failure {
+
+        echo 'Deployment failed. Rolling back...'
+
+        // FIX 3: Guard rollback with an existence check before attempting
+        // 'kubectl rollout undo'. Previously the pipeline tried to roll back
+        // spring-app-green even when it had never been deployed (i.e. the
+        // pipeline failed before the 'Deploy GREEN' stage), causing a
+        // misleading "NotFound" error in the post-failure logs.
+        sh '''
+            if kubectl get deployment spring-app-green -n prod > /dev/null 2>&1; then
+                echo "Green deployment found — switching traffic back to blue and rolling back..."
+
+                kubectl patch service spring-app-service \
+                    -n prod \
+                    -p '{"spec":{"selector":{"app":"spring-app","color":"blue"}}}'
+
+                kubectl rollout undo deployment/spring-app-green -n prod
+            else
+                echo "Green deployment not found — pipeline failed before prod stage, no rollback needed."
+            fi
+        '''
+    }
+
+    always {
+        cleanWs()
+    }
+}
+
+}
