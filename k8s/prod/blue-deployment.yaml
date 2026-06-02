@@ -22,7 +22,7 @@ spec:
       containers:
       - name: spring-app
 
-        image: spring3hibernate:v2
+        image: IMAGE_PLACEHOLDER
 
         imagePullPolicy: Never
 
