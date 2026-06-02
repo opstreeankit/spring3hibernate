@@ -97,7 +97,6 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
-                // FIX: Minikube health check kept in its own sh block (no env needed here)
                 sh '''
                     echo "===== VERIFYING MINIKUBE IS REACHABLE ====="
                     MINIKUBE_HOST=$(minikube status --format='{{.Host}}' 2>/dev/null || echo "Nonexistent")
@@ -117,10 +116,6 @@ pipeline {
                     minikube status
                 '''
 
-                // FIX: eval + docker build in ONE sh block so the exported
-                // DOCKER_HOST / DOCKER_TLS_VERIFY env vars stay alive for
-                // the entire build command. A new sh step spawns a fresh
-                // shell and loses everything eval set in the previous one.
                 sh """
                     eval \$(minikube docker-env)
                     echo "===== BUILDING INTO MINIKUBE DOCKER DAEMON ====="
@@ -134,17 +129,22 @@ pipeline {
         stage('Deploy DEV') {
             steps {
                 milestone(1)
-                // FIX: eval + kubectl in ONE sh block. kubectl apply triggers
-                // the pod scheduler which resolves the image name — it must
-                // happen inside the same shell where DOCKER_HOST is set.
-                // imagePullPolicy: Never in deployment.yaml is also required
-                // (see k8s/dev/deployment.yaml) so K8s never attempts a
-                // remote pull for a locally-built image.
                 sh """
                     eval \$(minikube docker-env)
+
+                    # Replace placeholder with real image tag
                     sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/dev/deployment.yaml
+
                     kubectl apply -n dev -f k8s/dev/deployment.yaml
                     kubectl apply -n dev -f k8s/dev/service.yaml
+
+                    # FIX: Restore placeholder immediately after apply so the
+                    # next build always has IMAGE_PLACEHOLDER to substitute.
+                    # Without this, sed becomes a no-op on the second run and
+                    # Kubernetes sees an unchanged spec — leaving the old broken
+                    # pod in place instead of rolling out the new image.
+                    sed -i 's|${APP_NAME}:${IMAGE_TAG}|IMAGE_PLACEHOLDER|g' k8s/dev/deployment.yaml
+
                     kubectl rollout status deployment/spring-app -n dev --timeout=180s
                 """
             }
@@ -176,12 +176,18 @@ pipeline {
         stage('Deploy STAGING') {
             steps {
                 milestone(2)
-                // FIX: same single-sh-block pattern as Deploy DEV
                 sh """
                     eval \$(minikube docker-env)
+
+                    # Replace placeholder with real image tag
                     sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/staging/deployment.yaml
+
                     kubectl apply -n staging -f k8s/staging/deployment.yaml
                     kubectl apply -n staging -f k8s/staging/service.yaml
+
+                    # FIX: Restore placeholder immediately after apply
+                    sed -i 's|${APP_NAME}:${IMAGE_TAG}|IMAGE_PLACEHOLDER|g' k8s/staging/deployment.yaml
+
                     kubectl rollout status deployment/spring-app -n staging --timeout=180s
                 """
             }
@@ -213,11 +219,17 @@ pipeline {
         stage('Deploy GREEN') {
             steps {
                 milestone(3)
-                // FIX: same single-sh-block pattern as Deploy DEV
                 sh """
                     eval \$(minikube docker-env)
+
+                    # Replace placeholder with real image tag
                     sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/prod/green-deployment.yaml
+
                     kubectl apply -n prod -f k8s/prod/green-deployment.yaml
+
+                    # FIX: Restore placeholder immediately after apply
+                    sed -i 's|${APP_NAME}:${IMAGE_TAG}|IMAGE_PLACEHOLDER|g' k8s/prod/green-deployment.yaml
+
                     kubectl rollout status deployment/spring-app-green -n prod --timeout=180s
                 """
             }
@@ -283,6 +295,15 @@ pipeline {
         failure {
             echo 'Deployment failed. Rolling back...'
             sh '''
+                # Restore any deployment.yaml files that may have had their
+                # placeholder replaced before the failure, so the next build
+                # is not stuck with a hardcoded image tag in the YAML.
+                for f in k8s/dev/deployment.yaml k8s/staging/deployment.yaml k8s/prod/green-deployment.yaml; do
+                    if [ -f "$f" ]; then
+                        sed -i "s|${APP_NAME}:[0-9]*|IMAGE_PLACEHOLDER|g" "$f" 2>/dev/null || true
+                    fi
+                done
+
                 if kubectl get deployment spring-app-green -n prod > /dev/null 2>&1; then
                     echo "Green deployment found — switching traffic back to blue and rolling back..."
                     kubectl patch service spring-app-service \
