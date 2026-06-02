@@ -132,14 +132,11 @@ pipeline {
                 sh """
                     eval \$(minikube docker-env)
 
-                    # Replace placeholder with real image tag
                     sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/dev/deployment.yaml
 
                     kubectl apply -n dev -f k8s/dev/deployment.yaml
                     kubectl apply -n dev -f k8s/dev/service.yaml
 
-                    # FIX: Restore placeholder immediately after apply so the
-                    # next build always has IMAGE_PLACEHOLDER to substitute.
                     sed -i 's|${APP_NAME}:${IMAGE_TAG}|IMAGE_PLACEHOLDER|g' k8s/dev/deployment.yaml
 
                     kubectl rollout status deployment/spring-app -n dev --timeout=180s
@@ -150,7 +147,6 @@ pipeline {
         stage('DEV Health Check') {
             steps {
                 script {
-                    // ✅ FIX: Use minikube ip instead of localhost
                     def minikubeIP = sh(script: 'minikube ip', returnStdout: true).trim()
                     retry(5) {
                         sleep 15
@@ -178,13 +174,11 @@ pipeline {
                 sh """
                     eval \$(minikube docker-env)
 
-                    # Replace placeholder with real image tag
                     sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/staging/deployment.yaml
 
                     kubectl apply -n staging -f k8s/staging/deployment.yaml
                     kubectl apply -n staging -f k8s/staging/service.yaml
 
-                    # FIX: Restore placeholder immediately after apply
                     sed -i 's|${APP_NAME}:${IMAGE_TAG}|IMAGE_PLACEHOLDER|g' k8s/staging/deployment.yaml
 
                     kubectl rollout status deployment/spring-app -n staging --timeout=180s
@@ -195,7 +189,6 @@ pipeline {
         stage('STAGING Health Check') {
             steps {
                 script {
-                    // ✅ FIX: Use minikube ip instead of localhost
                     def minikubeIP = sh(script: 'minikube ip', returnStdout: true).trim()
                     retry(5) {
                         sleep 15
@@ -223,12 +216,21 @@ pipeline {
                 sh """
                     eval \$(minikube docker-env)
 
-                    # Replace placeholder with real image tag
+                    # Deploy blue first if it does not exist yet (initial setup)
+                    if ! kubectl get deployment spring-app-blue -n prod > /dev/null 2>&1; then
+                        echo "Blue deployment not found — creating initial blue deployment..."
+                        sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/prod/blue-deployment.yaml
+                        kubectl apply -n prod -f k8s/prod/blue-deployment.yaml
+                        sed -i 's|${APP_NAME}:${IMAGE_TAG}|IMAGE_PLACEHOLDER|g' k8s/prod/blue-deployment.yaml
+                        kubectl rollout status deployment/spring-app-blue -n prod --timeout=180s
+                    fi
+
+                    # FIX: Apply prod service so NodePort 30082 is exposed
+                    kubectl apply -n prod -f k8s/prod/service.yaml
+
+                    # Deploy green
                     sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/prod/green-deployment.yaml
-
                     kubectl apply -n prod -f k8s/prod/green-deployment.yaml
-
-                    # FIX: Restore placeholder immediately after apply
                     sed -i 's|${APP_NAME}:${IMAGE_TAG}|IMAGE_PLACEHOLDER|g' k8s/prod/green-deployment.yaml
 
                     kubectl rollout status deployment/spring-app-green -n prod --timeout=180s
@@ -239,7 +241,6 @@ pipeline {
         stage('GREEN Health Check') {
             steps {
                 script {
-                    // ✅ FIX: Use minikube ip instead of localhost
                     def minikubeIP = sh(script: 'minikube ip', returnStdout: true).trim()
                     retry(10) {
                         sleep 10
@@ -265,7 +266,6 @@ pipeline {
         stage('Production Verification') {
             steps {
                 script {
-                    // ✅ FIX: Use minikube ip instead of localhost
                     def minikubeIP = sh(script: 'minikube ip', returnStdout: true).trim()
                     retry(5) {
                         sleep 10
@@ -300,10 +300,7 @@ pipeline {
         failure {
             echo 'Deployment failed. Rolling back...'
             sh '''
-                # Restore any deployment.yaml files that may have had their
-                # placeholder replaced before the failure, so the next build
-                # is not stuck with a hardcoded image tag in the YAML.
-                for f in k8s/dev/deployment.yaml k8s/staging/deployment.yaml k8s/prod/green-deployment.yaml; do
+                for f in k8s/dev/deployment.yaml k8s/staging/deployment.yaml k8s/prod/green-deployment.yaml k8s/prod/blue-deployment.yaml; do
                     if [ -f "$f" ]; then
                         sed -i "s|${APP_NAME}:[0-9]*|IMAGE_PLACEHOLDER|g" "$f" 2>/dev/null || true
                     fi
@@ -311,9 +308,13 @@ pipeline {
 
                 if kubectl get deployment spring-app-green -n prod > /dev/null 2>&1; then
                     echo "Green deployment found — switching traffic back to blue and rolling back..."
-                    kubectl patch service spring-app-service \
-                        -n prod \
-                        -p '{"spec":{"selector":{"app":"spring-app","color":"blue"}}}'
+                    if kubectl get service spring-app-service -n prod > /dev/null 2>&1; then
+                        kubectl patch service spring-app-service \
+                            -n prod \
+                            -p '{"spec":{"selector":{"app":"spring-app","color":"blue"}}}'
+                    else
+                        echo "Prod service not found — skipping traffic switch."
+                    fi
                     kubectl rollout undo deployment/spring-app-green -n prod
                 else
                     echo "Green deployment not found — pipeline failed before prod stage, no rollback needed."
