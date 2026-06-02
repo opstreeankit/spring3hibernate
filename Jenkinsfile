@@ -65,49 +65,14 @@ pipeline {
             }
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // FIX: OWASP Dependency Check moved into its own stage, guarded by a
-        // when-expression so it ONLY runs when:
-        //   (a) the build was triggered by the weekly cron schedule, OR
-        //   (b) someone manually sets RUN_OWASP=true on a parameterised build.
-        //
-        // ROOT CAUSE OF THE 30-MIN HANG:
-        //   dependency-check-maven downloads the entire NVD database
-        //   (~354,872 CVE records) on every build. Without an NVD API key,
-        //   NIST throttles the feed to ~1 record/s → 60–90 minutes per run.
-        //
-        // HOW THE FIX WORKS:
-        //   1. The plugin is removed from the default Maven lifecycle in
-        //      pom.xml and placed inside the 'owasp' Maven profile.
-        //   2. This Jenkins stage passes '-Powasp' to activate it only when
-        //      the when-condition is true.
-        //   3. The NVD API key is injected via Jenkins credentials
-        //      (id: 'NVD_API_KEY') as a Secret Text credential.  The plugin
-        //      uses the key to raise the NVD download rate from ~1 rec/s to
-        //      ~50 rec/s — a 50× speedup on the first run (< 2 min after that
-        //      because only deltas are downloaded from the local cache).
-        //
-        // HOW TO GET A FREE NVD API KEY:
-        //   https://nvd.nist.gov/developers/request-an-api-key
-        //   Then in Jenkins → Manage Jenkins → Credentials add a Secret Text
-        //   credential with ID exactly 'NVD_API_KEY'.
-        //
-        // TO TRIGGER AN ON-DEMAND SCAN:
-        //   Build with Parameter  RUN_OWASP = true
-        //   (add a Boolean Parameter named RUN_OWASP to the job config).
-        // ─────────────────────────────────────────────────────────────────────
         stage('OWASP Dependency Scan') {
             when {
                 anyOf {
-                    // Run automatically every Sunday at 02:00
                     triggeredBy 'TimerTrigger'
-                    // Run when the job parameter RUN_OWASP is set to 'true'
                     expression { return params.RUN_OWASP == true }
                 }
             }
             steps {
-                // withCredentials injects the NVD API key without printing
-                // it in the console log (masked automatically by Jenkins).
                 withCredentials([string(credentialsId: 'NVD_API_KEY', variable: 'NVD_KEY')]) {
                     sh """
                         echo "===== OWASP DEPENDENCY CHECK ====="
@@ -118,7 +83,6 @@ pipeline {
             }
             post {
                 always {
-                    // Publish the HTML report to the Jenkins job page.
                     publishHTML(target: [
                         allowMissing:          true,
                         alwaysLinkToLastBuild: true,
@@ -133,6 +97,7 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
+                // FIX: Minikube health check kept in its own sh block (no env needed here)
                 sh '''
                     echo "===== VERIFYING MINIKUBE IS REACHABLE ====="
                     MINIKUBE_HOST=$(minikube status --format='{{.Host}}' 2>/dev/null || echo "Nonexistent")
@@ -152,6 +117,10 @@ pipeline {
                     minikube status
                 '''
 
+                // FIX: eval + docker build in ONE sh block so the exported
+                // DOCKER_HOST / DOCKER_TLS_VERIFY env vars stay alive for
+                // the entire build command. A new sh step spawns a fresh
+                // shell and loses everything eval set in the previous one.
                 sh """
                     eval \$(minikube docker-env)
                     echo "===== BUILDING INTO MINIKUBE DOCKER DAEMON ====="
@@ -165,12 +134,18 @@ pipeline {
         stage('Deploy DEV') {
             steps {
                 milestone(1)
+                // FIX: eval + kubectl in ONE sh block. kubectl apply triggers
+                // the pod scheduler which resolves the image name — it must
+                // happen inside the same shell where DOCKER_HOST is set.
+                // imagePullPolicy: Never in deployment.yaml is also required
+                // (see k8s/dev/deployment.yaml) so K8s never attempts a
+                // remote pull for a locally-built image.
                 sh """
+                    eval \$(minikube docker-env)
                     sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/dev/deployment.yaml
                     kubectl apply -n dev -f k8s/dev/deployment.yaml
                     kubectl apply -n dev -f k8s/dev/service.yaml
-                    kubectl rollout status deployment/spring-app \
-                    -n dev --timeout=180s
+                    kubectl rollout status deployment/spring-app -n dev --timeout=180s
                 """
             }
         }
@@ -201,12 +176,13 @@ pipeline {
         stage('Deploy STAGING') {
             steps {
                 milestone(2)
+                // FIX: same single-sh-block pattern as Deploy DEV
                 sh """
+                    eval \$(minikube docker-env)
                     sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/staging/deployment.yaml
                     kubectl apply -n staging -f k8s/staging/deployment.yaml
                     kubectl apply -n staging -f k8s/staging/service.yaml
-                    kubectl rollout status deployment/spring-app \
-                    -n staging --timeout=180s
+                    kubectl rollout status deployment/spring-app -n staging --timeout=180s
                 """
             }
         }
@@ -237,11 +213,12 @@ pipeline {
         stage('Deploy GREEN') {
             steps {
                 milestone(3)
+                // FIX: same single-sh-block pattern as Deploy DEV
                 sh """
+                    eval \$(minikube docker-env)
                     sed -i 's|IMAGE_PLACEHOLDER|${APP_NAME}:${IMAGE_TAG}|g' k8s/prod/green-deployment.yaml
                     kubectl apply -n prod -f k8s/prod/green-deployment.yaml
-                    kubectl rollout status deployment/spring-app-green \
-                    -n prod --timeout=180s
+                    kubectl rollout status deployment/spring-app-green -n prod --timeout=180s
                 """
             }
         }
@@ -295,13 +272,6 @@ pipeline {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // WEEKLY OWASP CRON SCHEDULE
-    // Add this triggers block to your job's pipeline definition so the scan
-    // runs automatically every Sunday at 02:00 without blocking normal CI.
-    // If you use a Multibranch Pipeline or scan from SCM, put these triggers
-    // inside a properties() step in the pipeline script instead.
-    // ─────────────────────────────────────────────────────────────────────
     // triggers {
     //     cron('0 2 * * 0')   // every Sunday at 02:00
     // }
