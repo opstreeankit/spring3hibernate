@@ -140,9 +140,6 @@ pipeline {
 
                     # FIX: Restore placeholder immediately after apply so the
                     # next build always has IMAGE_PLACEHOLDER to substitute.
-                    # Without this, sed becomes a no-op on the second run and
-                    # Kubernetes sees an unchanged spec — leaving the old broken
-                    # pod in place instead of rolling out the new image.
                     sed -i 's|${APP_NAME}:${IMAGE_TAG}|IMAGE_PLACEHOLDER|g' k8s/dev/deployment.yaml
 
                     kubectl rollout status deployment/spring-app -n dev --timeout=180s
@@ -153,10 +150,12 @@ pipeline {
         stage('DEV Health Check') {
             steps {
                 script {
+                    // ✅ FIX: Use minikube ip instead of localhost
+                    def minikubeIP = sh(script: 'minikube ip', returnStdout: true).trim()
                     retry(5) {
                         sleep 15
                         httpRequest(
-                            url: 'http://localhost:30080/',
+                            url: "http://${minikubeIP}:30080/",
                             validResponseCodes: '200'
                         )
                     }
@@ -196,10 +195,12 @@ pipeline {
         stage('STAGING Health Check') {
             steps {
                 script {
+                    // ✅ FIX: Use minikube ip instead of localhost
+                    def minikubeIP = sh(script: 'minikube ip', returnStdout: true).trim()
                     retry(5) {
                         sleep 15
                         httpRequest(
-                            url: 'http://localhost:30081/',
+                            url: "http://${minikubeIP}:30081/",
                             validResponseCodes: '200'
                         )
                     }
@@ -238,10 +239,12 @@ pipeline {
         stage('GREEN Health Check') {
             steps {
                 script {
+                    // ✅ FIX: Use minikube ip instead of localhost
+                    def minikubeIP = sh(script: 'minikube ip', returnStdout: true).trim()
                     retry(10) {
                         sleep 10
                         httpRequest(
-                            url: 'http://localhost:30082/',
+                            url: "http://${minikubeIP}:30082/",
                             validResponseCodes: '200'
                         )
                     }
@@ -262,10 +265,12 @@ pipeline {
         stage('Production Verification') {
             steps {
                 script {
+                    // ✅ FIX: Use minikube ip instead of localhost
+                    def minikubeIP = sh(script: 'minikube ip', returnStdout: true).trim()
                     retry(5) {
                         sleep 10
                         httpRequest(
-                            url: 'http://localhost:30082/',
+                            url: "http://${minikubeIP}:30082/",
                             validResponseCodes: '200'
                         )
                     }
