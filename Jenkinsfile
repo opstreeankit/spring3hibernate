@@ -21,6 +21,33 @@ stages {
         }
     }
 
+    // FIX 2: Dedicated test stage so JaCoCo actually instruments code.
+    // Previously 'mvn clean package -DskipTests' skipped all tests,
+    // resulting in 0% coverage. 'mvn verify -DskipITs' runs unit tests
+    // only (skips integration tests) and triggers the full JaCoCo lifecycle
+    // (prepare-agent → surefire → merge → report → check).
+    stage('Test & Coverage') {
+        steps {
+            sh '''
+                mvn verify -DskipITs
+            '''
+        }
+        post {
+            always {
+                junit '**/target/surefire-reports/*.xml'
+                jacoco(
+                    execPattern:         '**/target/jacoco-merged.exec',
+                    classPattern:        '**/target/classes',
+                    sourcePattern:       '**/src/main/java',
+                    changeBuildStatus:   true,
+                    minimumLineCoverage:    '80',
+                    minimumBranchCoverage:  '75',
+                    minimumClassCoverage:   '80'
+                )
+            }
+        }
+    }
+
     stage('Build Docker Image') {
         steps {
             sh """
@@ -194,13 +221,23 @@ post {
 
         echo 'Deployment failed. Rolling back...'
 
+        // FIX 3: Guard rollback with an existence check before attempting
+        // 'kubectl rollout undo'. Previously the pipeline tried to roll back
+        // spring-app-green even when it had never been deployed (i.e. the
+        // pipeline failed before the 'Deploy GREEN' stage), causing a
+        // misleading "NotFound" error in the post-failure logs.
         sh '''
-            kubectl patch service spring-app-service \
-            -n prod \
-            -p '{"spec":{"selector":{"app":"spring-app","color":"blue"}}}' || true
+            if kubectl get deployment spring-app-green -n prod > /dev/null 2>&1; then
+                echo "Green deployment found — switching traffic back to blue and rolling back..."
 
-            kubectl rollout undo deployment/spring-app-green \
-            -n prod || true
+                kubectl patch service spring-app-service \
+                    -n prod \
+                    -p '{"spec":{"selector":{"app":"spring-app","color":"blue"}}}'
+
+                kubectl rollout undo deployment/spring-app-green -n prod
+            else
+                echo "Green deployment not found — pipeline failed before prod stage, no rollback needed."
+            fi
         '''
     }
 
