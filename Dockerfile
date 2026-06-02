@@ -1,5 +1,4 @@
-# ✅ FIX: Java 8 builder to match pom.xml <source>8</source><target>8</target>
-# Previous: eclipse-temurin-11 (Java 11 builder with Java 8 bytecode target = mismatch)
+# ✅ Java 8 builder — matches pom.xml <source>8</source><target>8</target>
 FROM maven:3.9.9-eclipse-temurin-8 AS builder
 
 RUN mvn -version
@@ -10,9 +9,10 @@ WORKDIR /usr/src/mymaven/
 RUN mvn clean install
 RUN mvn package
 
-# ✅ FIX: Tomcat 7 with JRE 8 instead of JRE 7
-# Previous: tomcat:7-jre7-alpine (Java 7 runtime cannot load Java 8 class files = UnsupportedClassVersionError)
-FROM tomcat:7.0.109-jre8-alpine
+# ✅ FIX: tomcat:7-jre8-alpine does NOT exist on Docker Hub.
+#    Using tomcat:9.0-jre8 — the latest Tomcat version that supports JRE 8.
+#    Tomcat 9 is fully backward compatible with Tomcat 7 servlet apps.
+FROM tomcat:9.0-jre8
 
 MAINTAINER "opstree <opstree@gmail.com>"
 
