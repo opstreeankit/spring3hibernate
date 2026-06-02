@@ -10,17 +10,17 @@ options {
 }
 stages {
     stage('Debug Maven') {
-            steps {
-                sh '''
-                    echo "===== JAVA VERSION ====="
-                    java -version
-                    echo "===== MAVEN VERSION ====="
-                    mvn -version
-                    echo "===== DOCKER VERSION ====="
-                    docker --version
-                '''
-            }
+        steps {
+            sh '''
+                echo "===== JAVA VERSION ====="
+                java -version
+                echo "===== MAVEN VERSION ====="
+                mvn -version
+                echo "===== DOCKER VERSION ====="
+                docker --version
+            '''
         }
+    }
 
     stage('Build Application') {
         steps {
@@ -29,6 +29,7 @@ stages {
             '''
         }
     }
+
     // FIX 2: Dedicated test stage so JaCoCo actually instruments code.
     // Previously 'mvn clean package -DskipTests' skipped all tests,
     // resulting in 0% coverage. 'mvn verify -DskipITs' runs unit tests
@@ -55,35 +56,72 @@ stages {
             }
         }
     }
+
     stage('Build Docker Image') {
         steps {
-            // FIX: Ensure minikube cluster is running before loading the image.
-            // 'minikube image load' fails with "cluster does not exist" when
-            // minikube has not been started in the Jenkins agent session.
-            // 'minikube status' returns non-zero if stopped/absent, so we
-            // start it only when necessary. --driver=docker is the most
-            // compatible choice in a CI environment where Docker is available.
+            // ROOT CAUSE: Running 'minikube start' inside the Jenkins pipeline
+            // as root with --driver=docker causes K8S_APISERVER_MISSING because
+            // the kube-apiserver process never starts due to cgroup v2 conflicts
+            // between the outer Docker daemon (Jenkins) and the inner minikube
+            // Docker-in-Docker container on Ubuntu 22.04.
+            //
+            // FIX: Never start minikube in the pipeline. Instead:
+            //   1. Minikube is started ONCE manually on the host and left running
+            //      as a persistent cluster (see prerequisite note below).
+            //   2. The pipeline uses 'eval $(minikube docker-env)' to redirect
+            //      DOCKER_HOST to minikube's internal Docker socket.
+            //   3. 'docker build' then writes the image directly into minikube's
+            //      daemon — no 'minikube image load' step needed at all.
+            //
+            // PREREQUISITE (one-time setup on the host, not in this pipeline):
+            //   Run this once as the same user Jenkins runs as:
+            //     $ minikube start --driver=docker --kubernetes-version=v1.35.1
+            //   Leave minikube running. Jenkins will connect to it every build
+            //   without ever starting or stopping it.
+            //
+            // WHY THIS SOLVES THE CGROUP PROBLEM:
+            //   minikube start (the expensive part that spawns kube-apiserver)
+            //   never runs inside the pipeline. Jenkins only talks to an already-
+            //   healthy cluster via its Docker socket. No cgroup negotiation,
+            //   no API server bootstrap, no 6-minute timeout.
+
             sh '''
-                echo "===== CHECKING MINIKUBE STATUS ====="
-                if minikube status --format='{{.Host}}' 2>/dev/null | grep -q "Running"; then
-                    echo "Minikube is already running."
-                else
-                    echo "Minikube is not running. Starting minikube..."
-                    minikube start --driver=docker
-                    echo "Waiting for minikube to be ready..."
-                    kubectl wait --for=condition=Ready node/minikube --timeout=120s
+                echo "===== VERIFYING MINIKUBE IS REACHABLE ====="
+                MINIKUBE_HOST=$(minikube status --format='{{.Host}}' 2>/dev/null || echo "Nonexistent")
+                if ! echo "$MINIKUBE_HOST" | grep -q "Running"; then
+                    echo "------------------------------------------------------------"
+                    echo "ERROR: Minikube is not running (status: $MINIKUBE_HOST)"
+                    echo ""
+                    echo "Please run this ONCE on the host machine as the Jenkins user:"
+                    echo "  minikube start --driver=docker --kubernetes-version=v1.35.1"
+                    echo ""
+                    echo "Leave minikube running between builds — the pipeline will"
+                    echo "connect to it without ever starting or stopping it."
+                    echo "------------------------------------------------------------"
+                    exit 1
                 fi
-                echo "===== MINIKUBE STATUS ====="
+                echo "Minikube is Running. Cluster is healthy."
                 minikube status
             '''
+
+            // Build the Docker image directly into minikube's internal daemon.
+            // eval $(minikube docker-env) exports four env vars for this shell:
+            //   DOCKER_TLS_VERIFY, DOCKER_HOST, DOCKER_CERT_PATH,
+            //   MINIKUBE_ACTIVE_DOCKERD
+            // These redirect all docker commands to minikube's socket.
+            // The host Docker daemon is completely unaffected.
+            // Because the image lands inside minikube's daemon, Kubernetes can
+            // pull it with imagePullPolicy: Never — no registry required.
             sh """
+                eval \$(minikube docker-env)
+                echo "===== BUILDING INTO MINIKUBE DOCKER DAEMON ====="
                 docker build -t ${APP_NAME}:${IMAGE_TAG} .
-            """
-            sh """
-                minikube image load ${APP_NAME}:${IMAGE_TAG}
+                echo "===== VERIFYING IMAGE IS VISIBLE TO MINIKUBE ====="
+                docker images | grep ${APP_NAME}
             """
         }
     }
+
     stage('Deploy DEV') {
         steps {
             milestone(1)
@@ -96,6 +134,7 @@ stages {
             """
         }
     }
+
     stage('DEV Health Check') {
         steps {
             script {
@@ -109,6 +148,7 @@ stages {
             }
         }
     }
+
     stage('Approve STAGING') {
         steps {
             input(
@@ -117,6 +157,7 @@ stages {
             )
         }
     }
+
     stage('Deploy STAGING') {
         steps {
             milestone(2)
@@ -129,6 +170,7 @@ stages {
             """
         }
     }
+
     stage('STAGING Health Check') {
         steps {
             script {
@@ -142,6 +184,7 @@ stages {
             }
         }
     }
+
     stage('Approve PRODUCTION') {
         steps {
             input(
@@ -150,6 +193,7 @@ stages {
             )
         }
     }
+
     stage('Deploy GREEN') {
         steps {
             milestone(3)
@@ -161,6 +205,7 @@ stages {
             """
         }
     }
+
     stage('GREEN Health Check') {
         steps {
             script {
@@ -174,6 +219,7 @@ stages {
             }
         }
     }
+
     stage('Switch Traffic To GREEN') {
         steps {
             sh '''
@@ -183,6 +229,7 @@ stages {
             '''
         }
     }
+
     stage('Production Verification') {
         steps {
             script {
@@ -196,6 +243,7 @@ stages {
             }
         }
     }
+
     stage('Scale Down BLUE') {
         steps {
             sh '''
